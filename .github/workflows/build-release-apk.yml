@@ -1,0 +1,177 @@
+name: Build Android Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Release version name (e.g. 1.0.0)'
+        required: false
+        default: '1.0.0'
+        type: string
+      publish_release:
+        description: 'Publish signed APK to GitHub Releases'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-apk:
+    name: Build Signed Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Resolve Release Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            RAW_TAG="${{ github.ref_name }}"
+            VERSION_NAME="${RAW_TAG#v}"
+            TAG_NAME="${RAW_TAG}"
+          else
+            VERSION_NAME="${{ github.event.inputs.version_name || '1.0.0' }}"
+            TAG_NAME="v${VERSION_NAME}-build.${{ github.run_number }}"
+          fi
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependencies
+        run: npm ci || npm install
+
+      - name: Build Production Web Bundle
+        run: npm run build
+
+      - name: Install Capacitor Android Packaging Tools
+        run: npm install --no-save @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+
+      - name: Generate & Configure Android Project
+        env:
+          APP_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          node scripts/configure-android.mjs
+          npx cap sync android
+
+      - name: Build Release APK (Gradle assembleRelease)
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Align & Sign Release APK
+        id: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        run: |
+          mkdir -p release-output
+          BUILD_TOOLS_DIR="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          echo "Using Android Build Tools: $BUILD_TOOLS_DIR"
+
+          UNSIGNED_APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          if [ ! -f "$UNSIGNED_APK" ]; then
+            UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          fi
+
+          if [ ! -f "$UNSIGNED_APK" ]; then
+            echo "Error: Release APK not found!"
+            exit 1
+          fi
+
+          KEYSTORE_PATH="release-output/release.jks"
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "Signing with repository production keystore secret..."
+            echo "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
+            FINAL_KEY_PASS="${KEY_PASS:-$KEYSTORE_PASS}"
+          else
+            echo "No custom keystore secrets configured — generating clean release keystore..."
+            KEYSTORE_PASS="BikeRedPullRelease2026!"
+            FINAL_KEY_PASS="$KEYSTORE_PASS"
+            KEY_ALIAS="bikeredpull"
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_PATH" \
+              -storetype PKCS12 \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -alias "$KEY_ALIAS" \
+              -storepass "$KEYSTORE_PASS" \
+              -keypass "$FINAL_KEY_PASS" \
+              -dname "CN=BIKE RED PULL, OU=Mobile Games, O=BIKE RED PULL, L=Mumbai, S=MH, C=IN"
+          fi
+
+          ALIGNED_APK="release-output/app-release-aligned.apk"
+          FINAL_APK_NAME="BIKE-RED-PULL-v${VERSION_NAME}-release.apk"
+          FINAL_APK_PATH="release-output/${FINAL_APK_NAME}"
+
+          "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:${KEYSTORE_PASS}" \
+            --key-pass "pass:${FINAL_KEY_PASS}" \
+            --out "$FINAL_APK_PATH" \
+            "$ALIGNED_APK"
+
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$FINAL_APK_PATH"
+          rm -f "$KEYSTORE_PATH" "$ALIGNED_APK"
+
+          echo "apk_path=${FINAL_APK_PATH}" >> "$GITHUB_OUTPUT"
+          echo "apk_name=${FINAL_APK_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Signed Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIKE-RED-PULL-Release-APK
+          path: ${{ steps.sign.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: BIKE RED PULL v${{ steps.version.outputs.version_name }} (Android Release APK)
+          body: |
+            ### BIKE RED PULL — Android Release APK
+            - **10 Real-World Motorcycles** (Yamaha R15 V4, Bajaj Pulsar N160, Harley-Davidson X440, KTM RC 390, Suzuki Hayabusa, BMW S1000RR, Honda CBR1000RR-R Fireblade, Aprilia RSV4, Ducati Panigale V4, Kawasaki Ninja H2R)
+            - **Interactive 360° Showroom & Custom `.GLB` Model Importer**
+            - **Touch-and-Hold Highway Acceleration**, 150 Red / 200 Black Road FX, Rivers & Bridges, and Funny Old Man "HA HA!" Co-Pilot
+            
+            Download the `.apk` file below and install directly on your Android device.
+          files: ${{ steps.sign.outputs.apk_path }}
+          draft: false
+          prerelease: false

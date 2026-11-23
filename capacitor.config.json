@@ -1,0 +1,13 @@
+{
+  "appId": "com.bikeredpull.game",
+  "appName": "BIKE RED PULL",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#070b14",
+    "allowMixedContent": true,
+    "webContentsDebuggingEnabled": false
+  }
+}
