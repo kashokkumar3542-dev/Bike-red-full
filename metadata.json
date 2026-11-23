@@ -1,0 +1,6 @@
+{
+  "name": "BIKE RED PULL",
+  "description": "High-speed 3D mobile motorcycle highway racing game with one-touch acceleration, red and black overdrive road zones, a funny laughing old man co-pilot, and a 3D bike shop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
